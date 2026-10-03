@@ -1,0 +1,4 @@
+miniredis
+shard/shard
+*.aof
+.DS_Store
