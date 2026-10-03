@@ -1,18 +1,12 @@
 # miniredis
 
-A distributed key value store in Go, built from scratch with nothing outside
-the standard library. It speaks the real Redis wire protocol, so `redis-cli`
-and `redis-benchmark` connect to it without knowing the difference, and it
-benchmarks at around 89% of real Redis on GET. Writes go to an append only log
-before the reply is sent, so it survives a `kill -9` and replays on boot. A
-router in front of several instances places each node at 150 points on a hash
-ring and sends a key to the next point clockwise, which means adding a fourth
-shard to three moves 23k of 100k keys instead of the 75k that `hash % n` would.
-Raft is next, so the cluster survives a node dying rather than losing that
-shard.
+A key value store in Go, written from scratch with only the standard library.
 
-```
-go test -race ./...
-go build -o miniredis . && ./miniredis -addr :6380
-go build -o shard ./shard && ./shard -addr :6390
-```
+It speaks the real Redis protocol, so redis-cli connects to it and doesn't know
+the difference. Writes go to a log before the reply is sent, so it survives
+being killed and picks up where it left off. A router in front of a few
+instances hashes each key onto a ring and sends it to the node that owns it, so
+adding a node only moves the keys right before it instead of nearly all of
+them.
+
+Raft is next, so a node can die without taking its keys with it.
