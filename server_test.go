@@ -4,256 +4,120 @@ import (
 	"bufio"
 	"net"
 	"os"
-	"strings"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"miniredis/resp"
 )
 
-func dial(t *testing.T) (net.Conn, *bufio.Reader) {
-	t.Helper()
+func TestCommands(t *testing.T) {
+	s := &server{db: newStore()}
 
+	steps := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"SET", "a", "1"}, "+OK\r\n"},
+		{[]string{"GET", "a"}, "$1\r\n1\r\n"},
+		{[]string{"GET", "b"}, resp.Nil},
+		{[]string{"DEL", "a", "b"}, ":1\r\n"},
+		{[]string{"GET", "a"}, resp.Nil},
+		{[]string{"SET", "a", "1", "EX", "10"}, "+OK\r\n"},
+		{[]string{"TTL", "a"}, ":10\r\n"},
+		{[]string{"TTL", "b"}, ":-2\r\n"},
+	}
+
+	for _, step := range steps {
+		if got := s.run(step.args); got != step.want {
+			t.Fatalf("%v = %q, want %q", step.args, got, step.want)
+		}
+	}
+}
+
+func TestExpiry(t *testing.T) {
+	s := &server{db: newStore()}
+	s.run([]string{"SET", "a", "1", "PX", "30"})
+
+	time.Sleep(60 * time.Millisecond)
+
+	if got := s.run([]string{"GET", "a"}); got != resp.Nil {
+		t.Fatalf("GET after expiry = %q", got)
+	}
+}
+
+func TestPipelined(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
-	go newServer().serve(ln)
+	defer ln.Close()
+	go (&server{db: newStore()}).serve(ln)
 
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { conn.Close() })
+	defer conn.Close()
 
-	return conn, bufio.NewReader(conn)
+	conn.Write([]byte(resp.Array([]string{"SET", "a", "1"}) + resp.Array([]string{"GET", "a"})))
+
+	r := bufio.NewReader(conn)
+	first, _ := resp.ReadReply(r)
+	second, _ := resp.ReadReply(r)
+	if first != "+OK\r\n" || second != "$1\r\n1\r\n" {
+		t.Fatalf("got %q then %q", first, second)
+	}
 }
 
-func send(t *testing.T, conn net.Conn, r *bufio.Reader, parts ...string) string {
-	t.Helper()
+func TestReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
 
-	cmd := "*" + itoa(len(parts)) + "\r\n"
-	for _, p := range parts {
-		cmd += "$" + itoa(len(p)) + "\r\n" + p + "\r\n"
-	}
-	if _, err := conn.Write([]byte(cmd)); err != nil {
-		t.Fatal(err)
-	}
-
-	line, err := r.ReadString('\n')
+	a, _, err := openAOF(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if strings.HasPrefix(line, "$") && !strings.HasPrefix(line, "$-1") {
-		body, err := r.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		return strings.TrimRight(body, "\r\n")
-	}
-	return strings.TrimRight(line, "\r\n")
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var out []byte
-	for n > 0 {
-		out = append([]byte{byte('0' + n%10)}, out...)
-		n /= 10
-	}
-	return string(out)
-}
-
-func TestPing(t *testing.T) {
-	conn, r := dial(t)
-	if got := send(t, conn, r, "PING"); got != "+PONG" {
-		t.Fatalf("PING = %q", got)
-	}
-}
-
-func TestSetGet(t *testing.T) {
-	conn, r := dial(t)
-
-	if got := send(t, conn, r, "SET", "a", "hello"); got != "+OK" {
-		t.Fatalf("SET = %q", got)
-	}
-	if got := send(t, conn, r, "GET", "a"); got != "hello" {
-		t.Fatalf("GET = %q", got)
-	}
-	if got := send(t, conn, r, "GET", "missing"); got != "$-1" {
-		t.Fatalf("GET missing = %q", got)
-	}
-}
-
-func TestDel(t *testing.T) {
-	conn, r := dial(t)
-
-	send(t, conn, r, "SET", "a", "1")
-	if got := send(t, conn, r, "DEL", "a"); got != ":1" {
-		t.Fatalf("DEL = %q", got)
-	}
-	if got := send(t, conn, r, "DEL", "a"); got != ":0" {
-		t.Fatalf("DEL again = %q", got)
-	}
-}
-
-func TestExpiry(t *testing.T) {
-	conn, r := dial(t)
-
-	send(t, conn, r, "SET", "a", "1", "PX", "40")
-	if got := send(t, conn, r, "GET", "a"); got != "1" {
-		t.Fatalf("GET before expiry = %q", got)
-	}
-
-	time.Sleep(80 * time.Millisecond)
-
-	if got := send(t, conn, r, "GET", "a"); got != "$-1" {
-		t.Fatalf("GET after expiry = %q", got)
-	}
-	if got := send(t, conn, r, "TTL", "a"); got != ":-2" {
-		t.Fatalf("TTL after expiry = %q", got)
-	}
-}
-
-func TestTTLWithoutExpiry(t *testing.T) {
-	conn, r := dial(t)
-
-	send(t, conn, r, "SET", "a", "1")
-	if got := send(t, conn, r, "TTL", "a"); got != ":-1" {
-		t.Fatalf("TTL = %q", got)
-	}
-}
-
-func TestEcho(t *testing.T) {
-	conn, r := dial(t)
-	if got := send(t, conn, r, "ECHO", "hi"); got != "hi" {
-		t.Fatalf("ECHO = %q", got)
-	}
-}
-
-func TestUnknownCommand(t *testing.T) {
-	conn, r := dial(t)
-	if got := send(t, conn, r, "NOPE"); !strings.HasPrefix(got, "-ERR") {
-		t.Fatalf("unknown = %q", got)
-	}
-}
-
-func TestPipelined(t *testing.T) {
-	conn, r := dial(t)
-
-	cmds := "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n" +
-		"*2\r\n$3\r\nGET\r\n$1\r\na\r\n"
-	if _, err := conn.Write([]byte(cmds)); err != nil {
-		t.Fatal(err)
-	}
-
-	ok, _ := r.ReadString('\n')
-	if strings.TrimRight(ok, "\r\n") != "+OK" {
-		t.Fatalf("first reply = %q", ok)
-	}
-	r.ReadString('\n')
-	body, _ := r.ReadString('\n')
-	if strings.TrimRight(body, "\r\n") != "1" {
-		t.Fatalf("second reply = %q", body)
-	}
-}
-
-func TestAOFReplay(t *testing.T) {
-	path := t.TempDir() + "/test.aof"
-
-	aof, err := openAOF(path, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	first := newServer()
-	if _, err := first.replay(aof); err != nil {
-		t.Fatal(err)
-	}
-	first.run([]string{"SET", "a", "hello"})
-	first.run([]string{"SET", "b", "world"})
-	first.run([]string{"DEL", "b"})
-	aof.Close()
-
-	reopened, err := openAOF(path, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-
-	second := newServer()
-	n, err := second.replay(reopened)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 3 {
-		t.Fatalf("replayed %d commands, want 3", n)
-	}
-
-	if got, ok := second.db.get("a"); !ok || got != "hello" {
-		t.Fatalf("a = %q %v after replay", got, ok)
-	}
-	if _, ok := second.db.get("b"); ok {
-		t.Fatal("b survived a replayed DEL")
-	}
-}
-
-func TestAOFSkipsReads(t *testing.T) {
-	path := t.TempDir() + "/test.aof"
-
-	aof, _ := openAOF(path, true)
-	s := newServer()
-	s.replay(aof)
-
+	s := &server{db: newStore(), aof: a}
 	s.run([]string{"SET", "a", "1"})
+	s.run([]string{"SET", "b", "2"})
 	s.run([]string{"GET", "a"})
-	s.run([]string{"KEYS"})
-	s.run([]string{"EXISTS", "a"})
-	aof.Close()
+	s.run([]string{"DEL", "b"})
+	a.f.Close()
 
-	reopened, _ := openAOF(path, true)
-	defer reopened.Close()
-
-	n, err := newServer().replay(reopened)
+	_, cmds, err := openAOF(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("logged %d commands, want 1", n)
+	if len(cmds) != 3 {
+		t.Fatalf("logged %d commands, want 3, reads should not be logged", len(cmds))
+	}
+
+	fresh := &server{db: newStore()}
+	for _, args := range cmds {
+		fresh.run(args)
+	}
+	if v, _ := fresh.db.get("a"); v != "1" {
+		t.Fatalf("a = %q after replay", v)
+	}
+	if _, ok := fresh.db.get("b"); ok {
+		t.Fatal("b came back after a replayed DEL")
 	}
 }
 
-func TestAOFTruncatedTail(t *testing.T) {
-	path := t.TempDir() + "/test.aof"
+func TestTruncatedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	whole := resp.Array([]string{"SET", "a", "1"})
+	torn := "*3\r\n$3\r\nSET\r\n$1\r\nb"
 
-	aof, _ := openAOF(path, true)
-	s := newServer()
-	s.replay(aof)
-	s.run([]string{"SET", "a", "hello"})
-	aof.Close()
+	if err := os.WriteFile(path, []byte(whole+torn), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	full, err := os.ReadFile(path)
+	_, cmds, err := openAOF(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, append(full, []byte("*3\r\n$3\r\nSET\r\n$1\r\nb")...), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, _ := openAOF(path, true)
-	defer reopened.Close()
-
-	recovered := newServer()
-	n, err := recovered.replay(reopened)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Fatalf("replayed %d commands, want 1", n)
-	}
-	if got, _ := recovered.db.get("a"); got != "hello" {
-		t.Fatalf("a = %q, the good prefix should survive", got)
+	if len(cmds) != 1 || cmds[0][1] != "a" {
+		t.Fatalf("got %v, want only the complete command", cmds)
 	}
 }

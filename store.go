@@ -23,12 +23,26 @@ func newStore() *store {
 	return &store{data: map[string]entry{}}
 }
 
+func (s *store) lookup(key string) (entry, bool) {
+	s.mu.RLock()
+	e, ok := s.data[key]
+	s.mu.RUnlock()
+
+	if ok && e.expired() {
+		s.del(key)
+		return entry{}, false
+	}
+	return e, ok
+}
+
 func (s *store) get(key string) (string, bool) {
 	e, ok := s.lookup(key)
-	if !ok {
-		return "", false
-	}
-	return e.value, true
+	return e.value, ok
+}
+
+func (s *store) expiry(key string) (time.Time, bool) {
+	e, ok := s.lookup(key)
+	return e.expires, ok
 }
 
 func (s *store) set(key, value string, ttl time.Duration) {
@@ -46,51 +60,31 @@ func (s *store) del(keys ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	removed := 0
+	n := 0
 	for _, key := range keys {
 		if _, ok := s.data[key]; ok {
 			delete(s.data, key)
-			removed++
+			n++
 		}
 	}
-	return removed
-}
-
-func (s *store) expiry(key string) (time.Time, bool) {
-	e, ok := s.lookup(key)
-	return e.expires, ok
+	return n
 }
 
 func (s *store) keys() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	keys := make([]string, 0, len(s.data))
+	out := make([]string, 0, len(s.data))
 	for key, e := range s.data {
 		if !e.expired() {
-			keys = append(keys, key)
+			out = append(out, key)
 		}
 	}
-	return keys
+	return out
 }
 
 func (s *store) flush() {
 	s.mu.Lock()
 	s.data = map[string]entry{}
 	s.mu.Unlock()
-}
-
-func (s *store) lookup(key string) (entry, bool) {
-	s.mu.RLock()
-	e, ok := s.data[key]
-	s.mu.RUnlock()
-
-	if !ok {
-		return entry{}, false
-	}
-	if e.expired() {
-		s.del(key)
-		return entry{}, false
-	}
-	return e, true
 }

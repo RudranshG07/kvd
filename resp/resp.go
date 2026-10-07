@@ -1,4 +1,3 @@
-// Package resp reads and writes the redis wire protocol.
 package resp
 
 import (
@@ -11,114 +10,12 @@ import (
 
 var ErrProtocol = errors.New("protocol error")
 
-// ReadCommand reads one array of bulk strings, which is how clients send
-// everything.
-func ReadCommand(r *bufio.Reader) ([]string, error) {
-	line, err := ReadLine(r)
-	if err != nil {
-		return nil, err
-	}
-	if len(line) < 2 || line[0] != '*' {
-		return nil, ErrProtocol
-	}
-
-	count, err := strconv.Atoi(line[1:])
-	if err != nil || count < 1 {
-		return nil, ErrProtocol
-	}
-
-	args := make([]string, count)
-	for i := range args {
-		if args[i], err = readBulk(r); err != nil {
-			return nil, err
-		}
-	}
-	return args, nil
-}
-
-// ReadReply copies one whole reply back, however many lines it spans.
-func ReadReply(r *bufio.Reader) (string, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return "", err
-	}
-
-	switch line[0] {
-	case '+', '-', ':':
-		return line, nil
-
-	case '$':
-		size, err := strconv.Atoi(trim(line[1:]))
-		if err != nil {
-			return "", ErrProtocol
-		}
-		if size < 0 {
-			return line, nil
-		}
-		body := make([]byte, size+2)
-		if _, err := io.ReadFull(r, body); err != nil {
-			return "", err
-		}
-		return line + string(body), nil
-
-	case '*':
-		count, err := strconv.Atoi(trim(line[1:]))
-		if err != nil {
-			return "", ErrProtocol
-		}
-		var b strings.Builder
-		b.WriteString(line)
-		for i := 0; i < count; i++ {
-			part, err := ReadReply(r)
-			if err != nil {
-				return "", err
-			}
-			b.WriteString(part)
-		}
-		return b.String(), nil
-	}
-
-	return "", ErrProtocol
-}
-
-func ReadLine(r *bufio.Reader) (string, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return "", err
-	}
-	return trim(line), nil
-}
-
-func readBulk(r *bufio.Reader) (string, error) {
-	line, err := ReadLine(r)
-	if err != nil {
-		return "", err
-	}
-	if len(line) < 2 || line[0] != '$' {
-		return "", ErrProtocol
-	}
-
-	size, err := strconv.Atoi(line[1:])
-	if err != nil || size < 0 {
-		return "", ErrProtocol
-	}
-
-	buf := make([]byte, size+2)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return "", err
-	}
-	return string(buf[:size]), nil
-}
-
-func trim(s string) string {
-	return strings.TrimSuffix(strings.TrimSuffix(s, "\n"), "\r")
-}
+const Nil = "$-1\r\n"
 
 func Simple(s string) string { return "+" + s + "\r\n" }
 func Fail(s string) string   { return "-ERR " + s + "\r\n" }
 func Integer(n int) string   { return ":" + strconv.Itoa(n) + "\r\n" }
 func Bulk(s string) string   { return "$" + strconv.Itoa(len(s)) + "\r\n" + s + "\r\n" }
-func NilBulk() string        { return "$-1\r\n" }
 
 func Array(items []string) string {
 	var b strings.Builder
@@ -129,7 +26,91 @@ func Array(items []string) string {
 	return b.String()
 }
 
-// ParseArray pulls the bulk strings back out of an array reply.
+func ReadCommand(r *bufio.Reader) ([]string, error) {
+	args, err := readArray(r)
+	if err == nil && len(args) == 0 {
+		err = ErrProtocol
+	}
+	return args, err
+}
+
 func ParseArray(reply string) ([]string, error) {
-	return ReadCommand(bufio.NewReader(strings.NewReader(reply)))
+	return readArray(bufio.NewReader(strings.NewReader(reply)))
+}
+
+func ReadReply(r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	if len(line) < 3 {
+		return "", ErrProtocol
+	}
+
+	switch line[0] {
+	case '+', '-', ':':
+		return line, nil
+	case '$':
+		n, err := strconv.Atoi(strings.TrimRight(line[1:], "\r\n"))
+		if err != nil {
+			return "", ErrProtocol
+		}
+		if n < 0 {
+			return line, nil
+		}
+		body := make([]byte, n+2)
+		_, err = io.ReadFull(r, body)
+		return line + string(body), err
+	case '*':
+		n, err := strconv.Atoi(strings.TrimRight(line[1:], "\r\n"))
+		if err != nil {
+			return "", ErrProtocol
+		}
+		for i := 0; i < n; i++ {
+			part, err := ReadReply(r)
+			if err != nil {
+				return "", err
+			}
+			line += part
+		}
+		return line, nil
+	}
+	return "", ErrProtocol
+}
+
+func readArray(r *bufio.Reader) ([]string, error) {
+	n, err := header(r, '*')
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]string, n)
+	for i := range out {
+		size, err := header(r, '$')
+		if err != nil {
+			return nil, err
+		}
+		buf := make([]byte, size+2)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		out[i] = string(buf[:size])
+	}
+	return out, nil
+}
+
+func header(r *bufio.Reader, kind byte) (int, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return 0, err
+	}
+	line = strings.TrimRight(line, "\r\n")
+	if len(line) < 2 || line[0] != kind {
+		return 0, ErrProtocol
+	}
+	n, err := strconv.Atoi(line[1:])
+	if err != nil || n < 0 {
+		return 0, ErrProtocol
+	}
+	return n, nil
 }

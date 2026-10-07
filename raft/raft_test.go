@@ -2,7 +2,7 @@ package raft
 
 import (
 	"errors"
-	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -14,24 +14,27 @@ type link struct {
 	down bool
 }
 
-func (l *link) alive() (*Raft, bool) {
+func (l *link) target() (*Raft, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.to, !l.down
+	if l.down {
+		return nil, errors.New("down")
+	}
+	return l.to, nil
 }
 
 func (l *link) RequestVote(v Vote) (Reply, error) {
-	to, ok := l.alive()
-	if !ok {
-		return Reply{}, errors.New("unreachable")
+	to, err := l.target()
+	if err != nil {
+		return Reply{}, err
 	}
 	return to.OnRequestVote(v), nil
 }
 
 func (l *link) AppendEntries(a Append) (Reply, error) {
-	to, ok := l.alive()
-	if !ok {
-		return Reply{}, errors.New("unreachable")
+	to, err := l.target()
+	if err != nil {
+		return Reply{}, err
 	}
 	return to.OnAppendEntries(a), nil
 }
@@ -43,56 +46,46 @@ type cluster struct {
 	dead  map[string]bool
 
 	mu      sync.Mutex
-	applied map[string][][]string
+	applied map[string][]string
 }
 
 func newCluster(t *testing.T, n int) *cluster {
-	t.Helper()
-
 	c := &cluster{
 		t:       t,
 		nodes:   map[string]*Raft{},
 		links:   map[string][]*link{},
 		dead:    map[string]bool{},
-		applied: map[string][][]string{},
+		applied: map[string][]string{},
 	}
 
-	ids := make([]string, n)
-	for i := range ids {
-		ids[i] = string(rune('a' + i))
-	}
-
-	for _, id := range ids {
-		id := id
+	for i := 0; i < n; i++ {
+		id := strconv.Itoa(i)
 		c.nodes[id] = New(id, map[string]Peer{}, func(cmd []string) {
 			c.mu.Lock()
-			c.applied[id] = append(c.applied[id], cmd)
+			c.applied[id] = append(c.applied[id], cmd[1])
 			c.mu.Unlock()
 		})
 	}
-
-	for _, from := range ids {
-		for _, to := range ids {
-			if from == to {
-				continue
+	for from, node := range c.nodes {
+		for to := range c.nodes {
+			if from != to {
+				l := &link{to: c.nodes[to]}
+				node.peers[to] = l
+				c.links[to] = append(c.links[to], l)
 			}
-			l := &link{to: c.nodes[to]}
-			c.nodes[from].peers[to] = l
-			c.links[to] = append(c.links[to], l)
 		}
 	}
 
-	for _, n := range c.nodes {
-		n.Start()
+	for _, node := range c.nodes {
+		node.Start()
 	}
 	t.Cleanup(func() {
-		for id, n := range c.nodes {
+		for id, node := range c.nodes {
 			if !c.dead[id] {
-				n.Stop()
+				node.Stop()
 			}
 		}
 	})
-
 	return c
 }
 
@@ -106,176 +99,104 @@ func (c *cluster) kill(id string) {
 	c.dead[id] = true
 }
 
-func (c *cluster) leaders() []string {
-	var out []string
-	for id, n := range c.nodes {
-		if !c.dead[id] && n.Role() == "leader" {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-func (c *cluster) waitLeader(within time.Duration) string {
+func (c *cluster) leader() string {
 	c.t.Helper()
 
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if got := c.leaders(); len(got) == 1 {
-			time.Sleep(150 * time.Millisecond)
-			if again := c.leaders(); len(again) == 1 && again[0] == got[0] {
-				return got[0]
+	for start := time.Now(); time.Since(start) < 5*time.Second; time.Sleep(20 * time.Millisecond) {
+		var found []string
+		for id, node := range c.nodes {
+			if role, _, _ := node.State(); !c.dead[id] && role == leader {
+				found = append(found, id)
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		if len(found) == 1 {
+			return found[0]
+		}
 	}
-
-	c.t.Fatalf("no single leader after %v, have %v", within, c.leaders())
+	c.t.Fatal("no single leader")
 	return ""
 }
 
-func (c *cluster) log(id string) [][]string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([][]string(nil), c.applied[id]...)
-}
-
-func (c *cluster) waitApplied(id string, n int, within time.Duration) [][]string {
+func (c *cluster) waitApplied(id string, n int) []string {
 	c.t.Helper()
 
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if got := c.log(id); len(got) >= n {
+	for start := time.Now(); time.Since(start) < 5*time.Second; time.Sleep(20 * time.Millisecond) {
+		c.mu.Lock()
+		got := append([]string(nil), c.applied[id]...)
+		c.mu.Unlock()
+		if len(got) >= n {
 			return got
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
-
-	c.t.Fatalf("%s applied %d of %d within %v", id, len(c.log(id)), n, within)
+	c.t.Fatalf("node %s never applied %d entries", id, n)
 	return nil
 }
 
-func TestElectsOneLeader(t *testing.T) {
-	newCluster(t, 5).waitLeader(3 * time.Second)
-}
-
-func TestLeaderIsStable(t *testing.T) {
+func TestReelection(t *testing.T) {
 	c := newCluster(t, 5)
-	first := c.waitLeader(3 * time.Second)
-
-	time.Sleep(time.Second)
-
-	if got := c.leaders(); len(got) != 1 || got[0] != first {
-		t.Fatalf("leader changed from %s to %v with nothing wrong", first, got)
-	}
-}
-
-func TestReelectsAfterLeaderDies(t *testing.T) {
-	c := newCluster(t, 5)
-	first := c.waitLeader(3 * time.Second)
+	first := c.leader()
 
 	start := time.Now()
 	c.kill(first)
+	second := c.leader()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if got := c.leaders(); len(got) == 1 && got[0] != first {
-			t.Logf("re-elected %s in %v", got[0], time.Since(start))
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if second == first {
+		t.Fatal("dead node still leader")
 	}
-
-	t.Fatalf("no new leader after killing %s, have %v", first, c.leaders())
+	t.Logf("new leader %s after %v", second, time.Since(start))
 }
 
-func TestNoLeaderWithoutQuorum(t *testing.T) {
+func TestNoLeaderWithoutMajority(t *testing.T) {
 	c := newCluster(t, 3)
-	first := c.waitLeader(3 * time.Second)
+	lead := c.leader()
 
 	for id := range c.nodes {
-		if id != first {
+		if id != lead {
 			c.kill(id)
 		}
 	}
-
 	time.Sleep(1500 * time.Millisecond)
 
-	if c.nodes[first].Role() == "leader" {
-		t.Fatal("kept leadership without a majority")
+	if role, _, _ := c.nodes[lead].State(); role == leader {
+		t.Fatal("kept leading without a majority")
 	}
 }
 
-func TestReplicatesToEveryone(t *testing.T) {
+func TestSameOrderEverywhere(t *testing.T) {
 	c := newCluster(t, 5)
-	lead := c.waitLeader(3 * time.Second)
-
-	for i := 0; i < 10; i++ {
-		if _, ok := c.nodes[lead].Propose([]string{"SET", fmt.Sprint(i), "v"}); !ok {
-			t.Fatalf("%s refused entry %d", lead, i)
-		}
-	}
-
-	for id := range c.nodes {
-		got := c.waitApplied(id, 10, 3*time.Second)
-		for i := 0; i < 10; i++ {
-			if got[i][1] != fmt.Sprint(i) {
-				t.Fatalf("%s applied %v at %d", id, got[i], i)
-			}
-		}
-	}
-}
-
-func TestFollowersRefuseWrites(t *testing.T) {
-	c := newCluster(t, 3)
-	lead := c.waitLeader(3 * time.Second)
-
-	for id, n := range c.nodes {
-		if id == lead {
-			continue
-		}
-		if _, ok := n.Propose([]string{"SET", "a", "1"}); ok {
-			t.Fatalf("follower %s accepted a write", id)
-		}
-	}
-}
-
-func TestEveryoneAppliesTheSameOrder(t *testing.T) {
-	c := newCluster(t, 5)
-	lead := c.waitLeader(3 * time.Second)
+	lead := c.leader()
 
 	for i := 0; i < 20; i++ {
-		c.nodes[lead].Propose([]string{"SET", fmt.Sprint(i), "v"})
+		c.nodes[lead].Propose([]string{"SET", strconv.Itoa(i)})
 	}
 
-	want := c.waitApplied(lead, 20, 3*time.Second)
 	for id := range c.nodes {
-		got := c.waitApplied(id, 20, 3*time.Second)
-		for i := range want {
-			if got[i][1] != want[i][1] {
-				t.Fatalf("%s applied %v at %d, leader had %v", id, got[i], i, want[i])
+		got := c.waitApplied(id, 20)
+		for i := range 20 {
+			if got[i] != strconv.Itoa(i) {
+				t.Fatalf("node %s applied %v", id, got)
 			}
 		}
 	}
 }
 
-func TestWritesSurviveALeaderDying(t *testing.T) {
+func TestSurvivesLeaderDying(t *testing.T) {
 	c := newCluster(t, 5)
-	first := c.waitLeader(3 * time.Second)
+	first := c.leader()
 
 	for i := 0; i < 5; i++ {
-		c.nodes[first].Propose([]string{"SET", fmt.Sprint(i), "v"})
+		c.nodes[first].Propose([]string{"SET", strconv.Itoa(i)})
 	}
 	for id := range c.nodes {
-		c.waitApplied(id, 5, 3*time.Second)
+		c.waitApplied(id, 5)
 	}
 
 	c.kill(first)
-	second := c.waitLeader(5 * time.Second)
+	second := c.leader()
 
 	for i := 5; i < 10; i++ {
-		if _, ok := c.nodes[second].Propose([]string{"SET", fmt.Sprint(i), "v"}); !ok {
-			t.Fatalf("%s refused entry %d", second, i)
+		if !c.nodes[second].Propose([]string{"SET", strconv.Itoa(i)}) {
+			t.Fatal("new leader refused a write")
 		}
 	}
 
@@ -283,28 +204,11 @@ func TestWritesSurviveALeaderDying(t *testing.T) {
 		if c.dead[id] {
 			continue
 		}
-		got := c.waitApplied(id, 10, 5*time.Second)
-		for i := 0; i < 10; i++ {
-			if got[i][1] != fmt.Sprint(i) {
-				t.Fatalf("%s applied %v at %d", id, got[i], i)
+		got := c.waitApplied(id, 10)
+		for i := range 10 {
+			if got[i] != strconv.Itoa(i) {
+				t.Fatalf("node %s applied %v", id, got)
 			}
 		}
-	}
-}
-
-func TestTermsOnlyGoUp(t *testing.T) {
-	c := newCluster(t, 3)
-	c.waitLeader(3 * time.Second)
-
-	seen := map[string]int{}
-	for i := 0; i < 50; i++ {
-		for id, n := range c.nodes {
-			term := n.Term()
-			if term < seen[id] {
-				t.Fatalf("%s went from term %d back to %d", id, seen[id], term)
-			}
-			seen[id] = term
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }

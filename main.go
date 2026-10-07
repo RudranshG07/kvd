@@ -7,31 +7,31 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":6380", "address to listen on")
+	addr := flag.String("addr", ":6380", "listen address")
 	path := flag.String("aof", "appendonly.aof", "append only file")
-	fsync := flag.Bool("fsync", true, "fsync after every write")
+	fsync := flag.Bool("fsync", true, "fsync every write")
 	flag.Parse()
 
-	f, err := openAOF(*path, *fsync)
+	a, cmds, err := openAOF(*path, *fsync)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
+	defer a.f.Close()
 
-	server := newServer()
-	replayed, err := server.replay(f)
-	if err != nil {
-		log.Fatal(err)
+	s := &server{db: newStore()}
+	for _, args := range cmds {
+		s.run(args)
 	}
-	if replayed > 0 {
-		log.Printf("replayed %d commands from %s", replayed, *path)
+	s.aof = a
+
+	if len(cmds) > 0 {
+		log.Printf("replayed %d commands", len(cmds))
 	}
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	log.Printf("listening on %s", *addr)
-	server.serve(ln)
+	s.serve(ln)
 }

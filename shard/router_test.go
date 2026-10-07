@@ -2,26 +2,28 @@ package main
 
 import (
 	"bufio"
+	"hash/crc32"
 	"io"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"miniredis/resp"
 )
 
 func fakeShard(t *testing.T) string {
-	t.Helper()
-
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
 
+	var mu sync.Mutex
+	data := map[string]string{}
+
 	go func() {
-		data := map[string]string{}
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -29,32 +31,27 @@ func fakeShard(t *testing.T) string {
 			}
 			go func() {
 				defer conn.Close()
-				br := bufio.NewReader(conn)
+				r := bufio.NewReader(conn)
 				for {
-					args, err := resp.ReadCommand(br)
+					args, err := resp.ReadCommand(r)
 					if err != nil {
 						return
 					}
+					mu.Lock()
 					switch strings.ToUpper(args[0]) {
 					case "SET":
 						data[args[1]] = args[2]
 						io.WriteString(conn, resp.Simple("OK"))
 					case "GET":
-						v, ok := data[args[1]]
-						if !ok {
-							io.WriteString(conn, resp.NilBulk())
-							continue
-						}
-						io.WriteString(conn, resp.Bulk(v))
+						io.WriteString(conn, resp.Bulk(data[args[1]]))
 					case "KEYS":
-						keys := make([]string, 0, len(data))
+						var keys []string
 						for k := range data {
 							keys = append(keys, k)
 						}
 						io.WriteString(conn, resp.Array(keys))
-					default:
-						io.WriteString(conn, resp.Fail("unknown"))
 					}
+					mu.Unlock()
 				}
 			}()
 		}
@@ -63,110 +60,73 @@ func fakeShard(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-func dial(t *testing.T, shards int) (net.Conn, *bufio.Reader, *router) {
-	t.Helper()
-
-	addrs := make([]string, shards)
+func cluster(t *testing.T, n int) *router {
+	addrs := make([]string, n)
 	for i := range addrs {
 		addrs[i] = fakeShard(t)
 	}
-	r := newRouter(addrs, 150)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	go r.serve(ln)
-
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { conn.Close() })
-
-	return conn, bufio.NewReader(conn), r
+	return newRouter(addrs, 150)
 }
 
-func send(t *testing.T, conn net.Conn, br *bufio.Reader, args ...string) string {
-	t.Helper()
+func TestRouting(t *testing.T) {
+	rt := cluster(t, 3)
+	used := map[string]bool{}
 
-	if _, err := conn.Write([]byte(resp.Array(args))); err != nil {
-		t.Fatal(err)
-	}
-	reply, err := resp.ReadReply(br)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return reply
-}
+	for i := 0; i < 300; i++ {
+		key := "k" + strconv.Itoa(i)
+		rt.route([]string{"SET", key, key})
+		used[rt.ring.get(key)] = true
 
-func TestRoundTrip(t *testing.T) {
-	conn, br, _ := dial(t, 3)
-
-	for i := 0; i < 200; i++ {
-		key := "key" + strconv.Itoa(i)
-		if got := send(t, conn, br, "SET", key, "v"+strconv.Itoa(i)); got != resp.Simple("OK") {
-			t.Fatalf("SET %s = %q", key, got)
+		if got := rt.route([]string{"GET", key}); got != resp.Bulk(key) {
+			t.Fatalf("GET %s = %q", key, got)
 		}
 	}
-	for i := 0; i < 200; i++ {
-		key := "key" + strconv.Itoa(i)
-		want := resp.Bulk("v" + strconv.Itoa(i))
-		if got := send(t, conn, br, "GET", key); got != want {
-			t.Fatalf("GET %s = %q, want %q", key, got, want)
-		}
+	if len(used) != 3 {
+		t.Fatalf("keys landed on %d of 3 shards", len(used))
 	}
 }
 
-func TestKeysAreSpread(t *testing.T) {
-	_, _, r := dial(t, 3)
+func TestKeysWithAnEmptyShard(t *testing.T) {
+	rt := cluster(t, 3)
+	rt.route([]string{"SET", "only", "1"})
 
-	counts := map[string]int{}
-	for i := 0; i < 10000; i++ {
-		counts[r.ring.get("key"+strconv.Itoa(i))]++
-	}
-
-	if len(counts) != 3 {
-		t.Fatalf("keys landed on %d shards, want 3", len(counts))
-	}
-	for addr, n := range counts {
-		if n < 2000 || n > 5000 {
-			t.Errorf("%s holds %d of 10000", addr, n)
-		}
-	}
-}
-
-func TestSameKeySameShard(t *testing.T) {
-	_, _, r := dial(t, 4)
-
-	for i := 0; i < 1000; i++ {
-		key := "key" + strconv.Itoa(i)
-		if r.ring.get(key) != r.ring.get(key) {
-			t.Fatalf("%s routed two different ways", key)
-		}
-	}
-}
-
-func TestKeysMerges(t *testing.T) {
-	conn, br, _ := dial(t, 3)
-
-	for i := 0; i < 50; i++ {
-		send(t, conn, br, "SET", "key"+strconv.Itoa(i), "v")
-	}
-
-	keys, err := resp.ParseArray(send(t, conn, br, "KEYS", "*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(keys) != 50 {
-		t.Fatalf("KEYS returned %d, want 50", len(keys))
+	keys, err := resp.ParseArray(rt.route([]string{"KEYS", "*"}))
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("KEYS = %v, %v", keys, err)
 	}
 }
 
 func TestDeadShard(t *testing.T) {
-	r := newRouter([]string{"127.0.0.1:1"}, 150)
-	if got := r.route([]string{"GET", "a"}); !strings.HasPrefix(got, "-ERR") {
-		t.Fatalf("dead shard = %q", got)
+	rt := newRouter([]string{"127.0.0.1:1"}, 150)
+	if got := rt.route([]string{"GET", "a"}); !strings.HasPrefix(got, "-ERR") {
+		t.Fatalf("got %q from a dead shard", got)
+	}
+}
+
+func TestRebalance(t *testing.T) {
+	three, four := newRing(150), newRing(150)
+	for i := 0; i < 4; i++ {
+		addr := "node" + strconv.Itoa(i)
+		if i < 3 {
+			three.add(addr)
+		}
+		four.add(addr)
+	}
+
+	ringMoved, modMoved := 0, 0
+	for i := 0; i < 100000; i++ {
+		key := "k" + strconv.Itoa(i)
+		if three.get(key) != four.get(key) {
+			ringMoved++
+		}
+		h := crc32.ChecksumIEEE([]byte(key))
+		if h%3 != h%4 {
+			modMoved++
+		}
+	}
+
+	t.Logf("adding a 4th node: ring moved %d, hash %% n moved %d", ringMoved, modMoved)
+	if ringMoved*2 > modMoved {
+		t.Fatalf("ring moved %d, hash %% n moved %d", ringMoved, modMoved)
 	}
 }

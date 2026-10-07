@@ -17,7 +17,7 @@ type node struct {
 
 	mu   sync.Mutex
 	conn net.Conn
-	br   *bufio.Reader
+	r    *bufio.Reader
 }
 
 func (n *node) send(args []string) (string, error) {
@@ -29,25 +29,19 @@ func (n *node) send(args []string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		n.conn, n.br = conn, bufio.NewReader(conn)
+		n.conn, n.r = conn, bufio.NewReader(conn)
 	}
 
-	if _, err := io.WriteString(n.conn, resp.Array(args)); err != nil {
-		n.drop()
-		return "", err
+	_, err := io.WriteString(n.conn, resp.Array(args))
+	reply := ""
+	if err == nil {
+		reply, err = resp.ReadReply(n.r)
 	}
-
-	reply, err := resp.ReadReply(n.br)
 	if err != nil {
-		n.drop()
-		return "", err
+		n.conn.Close()
+		n.conn = nil
 	}
-	return reply, nil
-}
-
-func (n *node) drop() {
-	n.conn.Close()
-	n.conn, n.br = nil, nil
+	return reply, err
 }
 
 type router struct {
@@ -56,53 +50,52 @@ type router struct {
 }
 
 func newRouter(addrs []string, replicas int) *router {
-	r := &router{ring: newRing(replicas), nodes: map[string]*node{}}
+	rt := &router{ring: newRing(replicas), nodes: map[string]*node{}}
 	for _, addr := range addrs {
-		r.ring.add(addr)
-		r.nodes[addr] = &node{addr: addr}
+		rt.ring.add(addr)
+		rt.nodes[addr] = &node{addr: addr}
 	}
-	return r
+	return rt
 }
 
-func (r *router) serve(ln net.Listener) {
+func (rt *router) serve(ln net.Listener) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go r.handle(conn)
+		go rt.handle(conn)
 	}
 }
 
-func (r *router) handle(conn net.Conn) {
+func (rt *router) handle(conn net.Conn) {
 	defer conn.Close()
 
-	br := bufio.NewReader(conn)
+	r := bufio.NewReader(conn)
 	for {
-		args, err := resp.ReadCommand(br)
+		args, err := resp.ReadCommand(r)
 		if err != nil {
 			return
 		}
-		if _, err := io.WriteString(conn, r.route(args)); err != nil {
+		if _, err := io.WriteString(conn, rt.route(args)); err != nil {
 			return
 		}
 	}
 }
 
-func (r *router) route(args []string) string {
+func (rt *router) route(args []string) string {
 	switch strings.ToUpper(args[0]) {
 	case "PING":
 		return resp.Simple("PONG")
 	case "COMMAND":
 		return resp.Array(nil)
 	case "FLUSHALL":
-		_, err := r.fanout(args)
-		if err != nil {
+		if _, err := rt.all(args); err != nil {
 			return resp.Fail(err.Error())
 		}
 		return resp.Simple("OK")
 	case "KEYS":
-		keys, err := r.fanout(args)
+		keys, err := rt.all(args)
 		if err != nil {
 			return resp.Fail(err.Error())
 		}
@@ -114,18 +107,18 @@ func (r *router) route(args []string) string {
 		return resp.Fail("wrong number of arguments")
 	}
 
-	owner := r.ring.get(args[1])
-	reply, err := r.nodes[owner].send(args)
+	owner := rt.ring.get(args[1])
+	reply, err := rt.nodes[owner].send(args)
 	if err != nil {
 		return resp.Fail(owner + " unreachable")
 	}
 	return reply
 }
 
-func (r *router) fanout(args []string) ([]string, error) {
-	var all []string
+func (rt *router) all(args []string) ([]string, error) {
+	var out []string
 
-	for addr, n := range r.nodes {
+	for addr, n := range rt.nodes {
 		reply, err := n.send(args)
 		if err != nil {
 			return nil, errors.New(addr + " unreachable")
@@ -137,7 +130,7 @@ func (r *router) fanout(args []string) ([]string, error) {
 		if err != nil {
 			return nil, errors.New("bad reply from " + addr)
 		}
-		all = append(all, items...)
+		out = append(out, items...)
 	}
-	return all, nil
+	return out, nil
 }

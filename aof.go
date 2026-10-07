@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"io"
 	"os"
 	"sync"
@@ -14,12 +15,22 @@ type aof struct {
 	fsync bool
 }
 
-func openAOF(path string, fsync bool) (*aof, error) {
+func openAOF(path string, fsync bool) (*aof, [][]string, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &aof{f: f, fsync: fsync}, nil
+
+	var cmds [][]string
+	r := bufio.NewReader(f)
+	for {
+		args, err := resp.ReadCommand(r)
+		if err != nil {
+			break
+		}
+		cmds = append(cmds, args)
+	}
+	return &aof{f: f, fsync: fsync}, cmds, nil
 }
 
 func (a *aof) write(args []string) error {
@@ -33,18 +44,4 @@ func (a *aof) write(args []string) error {
 		return a.f.Sync()
 	}
 	return nil
-}
-
-func (a *aof) rewind() error {
-	_, err := a.f.Seek(0, io.SeekStart)
-	return err
-}
-
-func (a *aof) end() error {
-	_, err := a.f.Seek(0, io.SeekEnd)
-	return err
-}
-
-func (a *aof) Close() error {
-	return a.f.Close()
 }

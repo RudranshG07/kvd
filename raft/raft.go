@@ -6,28 +6,13 @@ import (
 	"time"
 )
 
-type role int
-
 const (
-	follower role = iota
-	candidate
-	leader
-)
+	follower  = "follower"
+	candidate = "candidate"
+	leader    = "leader"
 
-func (r role) String() string {
-	switch r {
-	case candidate:
-		return "candidate"
-	case leader:
-		return "leader"
-	}
-	return "follower"
-}
-
-const (
-	heartbeat  = 50 * time.Millisecond
-	minTimeout = 300 * time.Millisecond
-	jitter     = 300 * time.Millisecond
+	heartbeat = 50 * time.Millisecond
+	timeout   = 300 * time.Millisecond
 )
 
 type Entry struct {
@@ -63,8 +48,7 @@ type Peer interface {
 }
 
 type Raft struct {
-	mu sync.Mutex
-
+	mu    sync.Mutex
 	id    string
 	peers map[string]Peer
 	apply func([]string)
@@ -72,19 +56,17 @@ type Raft struct {
 	term     int
 	votedFor string
 	log      []Entry
+	commit   int
+	applied  int
 
-	commit  int
-	applied int
-
-	role   role
+	role   string
 	leader string
+	next   map[string]int
+	match  map[string]int
 
-	next  map[string]int
-	match map[string]int
-
-	heard   time.Time
-	acked   time.Time
-	timeout time.Duration
+	heard time.Time
+	acked time.Time
+	wait  time.Duration
 
 	stop chan struct{}
 	done sync.WaitGroup
@@ -94,12 +76,12 @@ func New(id string, peers map[string]Peer, apply func([]string)) *Raft {
 	if apply == nil {
 		apply = func([]string) {}
 	}
-
 	r := &Raft{
 		id:    id,
 		peers: peers,
 		apply: apply,
 		log:   []Entry{{}},
+		role:  follower,
 		next:  map[string]int{},
 		match: map[string]int{},
 		stop:  make(chan struct{}),
@@ -118,39 +100,21 @@ func (r *Raft) Stop() {
 	r.done.Wait()
 }
 
-func (r *Raft) Role() string {
+func (r *Raft) State() (role string, term int, leader string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.role.String()
+	return r.role, r.term, r.leader
 }
 
-func (r *Raft) Term() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.term
-}
-
-func (r *Raft) Leader() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.leader
-}
-
-func (r *Raft) Committed() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.commit
-}
-
-func (r *Raft) Propose(cmd []string) (int, bool) {
+func (r *Raft) Propose(cmd []string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.role != leader {
-		return 0, false
+		return false
 	}
 	r.log = append(r.log, Entry{Term: r.term, Cmd: cmd})
-	return len(r.log) - 1, true
+	return true
 }
 
 func (r *Raft) loop() {
@@ -164,29 +128,30 @@ func (r *Raft) loop() {
 		case <-r.stop:
 			return
 		case <-tick.C:
-			r.mu.Lock()
-			role, lost := r.role, time.Since(r.acked) > r.timeout
-			expired := time.Since(r.heard) > r.timeout
-			r.mu.Unlock()
-
-			switch {
-			case role == leader && lost:
-				r.mu.Lock()
-				r.stepDown(r.term)
-				r.mu.Unlock()
-			case role == leader:
-				r.replicate()
-			case expired:
-				r.campaign()
-			}
-			r.flush()
 		}
+
+		r.mu.Lock()
+		role := r.role
+		lost := role == leader && time.Since(r.acked) > r.wait
+		expired := role != leader && time.Since(r.heard) > r.wait
+		if lost {
+			r.stepDown(r.term)
+		}
+		r.mu.Unlock()
+
+		switch {
+		case role == leader && !lost:
+			r.replicate()
+		case expired:
+			r.campaign()
+		}
+		r.flush()
 	}
 }
 
 func (r *Raft) reset() {
 	r.heard = time.Now()
-	r.timeout = minTimeout + time.Duration(rand.Int63n(int64(jitter)))
+	r.wait = timeout + time.Duration(rand.Int63n(int64(timeout)))
 }
 
 func (r *Raft) stepDown(term int) {
@@ -197,6 +162,10 @@ func (r *Raft) stepDown(term int) {
 	r.role = follower
 	r.leader = ""
 	r.reset()
+}
+
+func (r *Raft) majority() int {
+	return (len(r.peers)+1)/2 + 1
 }
 
 func (r *Raft) last() (int, int) {
@@ -214,33 +183,28 @@ func (r *Raft) campaign() {
 
 	term := r.term
 	idx, lastTerm := r.last()
-	ask := Vote{Term: term, Candidate: r.id, LastIdx: idx, LastTerm: lastTerm}
-	peers := r.others()
+	vote := Vote{Term: term, Candidate: r.id, LastIdx: idx, LastTerm: lastTerm}
 	r.mu.Unlock()
 
-	votes := make(chan bool, len(peers))
-	for _, p := range peers {
+	votes := make(chan bool, len(r.peers))
+	for _, p := range r.peers {
 		go func(p Peer) {
-			reply, err := p.RequestVote(ask)
-			if err != nil {
-				votes <- false
-				return
-			}
+			reply, err := p.RequestVote(vote)
 			r.mu.Lock()
-			if reply.Term > r.term {
+			if err == nil && reply.Term > r.term {
 				r.stepDown(reply.Term)
 			}
 			r.mu.Unlock()
-			votes <- reply.Ok
+			votes <- err == nil && reply.Ok
 		}(p)
 	}
 
-	won, need := 1, (len(peers)+1)/2+1
-	for range peers {
+	won := 1
+	for range r.peers {
 		if <-votes {
 			won++
 		}
-		if won >= need {
+		if won >= r.majority() {
 			break
 		}
 	}
@@ -248,17 +212,14 @@ func (r *Raft) campaign() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.role != candidate || r.term != term || won < need {
+	if r.role != candidate || r.term != term || won < r.majority() {
 		return
 	}
-
 	r.role = leader
 	r.leader = r.id
 	r.acked = time.Now()
-
-	idx, _ = r.last()
 	for id := range r.peers {
-		r.next[id] = idx + 1
+		r.next[id] = len(r.log)
 		r.match[id] = 0
 	}
 }
@@ -266,21 +227,15 @@ func (r *Raft) campaign() {
 func (r *Raft) replicate() {
 	r.mu.Lock()
 	term := r.term
-	ids := make([]string, 0, len(r.peers))
-	for id := range r.peers {
-		ids = append(ids, id)
-	}
 	r.mu.Unlock()
 
-	acks := make(chan bool, len(ids))
-	for _, id := range ids {
-		go func(id string) {
-			acks <- r.sendTo(id, term)
-		}(id)
+	acks := make(chan bool, len(r.peers))
+	for id := range r.peers {
+		go func(id string) { acks <- r.send(id, term) }(id)
 	}
 
 	alive := 1
-	for range ids {
+	for range r.peers {
 		select {
 		case ok := <-acks:
 			if ok {
@@ -291,7 +246,7 @@ func (r *Raft) replicate() {
 	}
 
 	r.mu.Lock()
-	if r.role == leader && r.term == term && alive >= (len(ids)+1)/2+1 {
+	if r.role == leader && r.term == term && alive >= r.majority() {
 		r.acked = time.Now()
 		r.advance()
 	}
@@ -300,19 +255,14 @@ func (r *Raft) replicate() {
 	time.Sleep(heartbeat)
 }
 
-func (r *Raft) sendTo(id string, term int) bool {
+func (r *Raft) send(id string, term int) bool {
 	r.mu.Lock()
 	if r.role != leader || r.term != term {
 		r.mu.Unlock()
 		return false
 	}
-
-	next := r.next[id]
-	if next < 1 {
-		next = 1
-	}
-
-	send := Append{
+	next := min(max(1, r.next[id]), len(r.log))
+	msg := Append{
 		Term:     term,
 		Leader:   r.id,
 		PrevIdx:  next - 1,
@@ -320,10 +270,9 @@ func (r *Raft) sendTo(id string, term int) bool {
 		Entries:  append([]Entry(nil), r.log[next:]...),
 		Commit:   r.commit,
 	}
-	peer := r.peers[id]
 	r.mu.Unlock()
 
-	reply, err := peer.AppendEntries(send)
+	reply, err := r.peers[id].AppendEntries(msg)
 	if err != nil {
 		return false
 	}
@@ -340,29 +289,23 @@ func (r *Raft) sendTo(id string, term int) bool {
 	}
 
 	if reply.Ok {
-		r.match[id] = send.PrevIdx + len(send.Entries)
+		r.match[id] = msg.PrevIdx + len(msg.Entries)
 		r.next[id] = r.match[id] + 1
-		return true
+	} else {
+		r.next[id] = max(1, reply.Hint)
 	}
-
-	r.next[id] = max(1, reply.Hint)
 	return true
 }
 
 func (r *Raft) advance() {
-	last, _ := r.last()
-
-	for n := last; n > r.commit; n-- {
-		if r.log[n].Term != r.term {
-			continue
-		}
-		copies := 1
+	for n := len(r.log) - 1; n > r.commit && r.log[n].Term == r.term; n-- {
+		count := 1
 		for id := range r.peers {
 			if r.match[id] >= n {
-				copies++
+				count++
 			}
 		}
-		if copies >= (len(r.peers)+1)/2+1 {
+		if count >= r.majority() {
 			r.commit = n
 			return
 		}
@@ -383,14 +326,6 @@ func (r *Raft) flush() {
 	}
 }
 
-func (r *Raft) others() []Peer {
-	out := make([]Peer, 0, len(r.peers))
-	for _, p := range r.peers {
-		out = append(out, p)
-	}
-	return out
-}
-
 func (r *Raft) OnRequestVote(v Vote) Reply {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -401,12 +336,10 @@ func (r *Raft) OnRequestVote(v Vote) Reply {
 	if v.Term > r.term {
 		r.stepDown(v.Term)
 	}
-	if r.votedFor != "" && r.votedFor != v.Candidate {
-		return Reply{Term: r.term}
-	}
 
 	idx, term := r.last()
-	if v.LastTerm < term || (v.LastTerm == term && v.LastIdx < idx) {
+	behind := v.LastTerm < term || (v.LastTerm == term && v.LastIdx < idx)
+	if behind || (r.votedFor != "" && r.votedFor != v.Candidate) {
 		return Reply{Term: r.term}
 	}
 
@@ -422,19 +355,13 @@ func (r *Raft) OnAppendEntries(a Append) Reply {
 	if a.Term < r.term {
 		return Reply{Term: r.term}
 	}
-	if a.Term > r.term {
-		r.stepDown(a.Term)
-	}
-
-	r.role = follower
+	r.stepDown(a.Term)
 	r.leader = a.Leader
-	r.reset()
 
 	if a.PrevIdx >= len(r.log) {
 		return Reply{Term: r.term, Hint: len(r.log)}
 	}
-	if r.log[a.PrevIdx].Term != a.PrevTerm {
-		bad := r.log[a.PrevIdx].Term
+	if bad := r.log[a.PrevIdx].Term; bad != a.PrevTerm {
 		hint := a.PrevIdx
 		for hint > 1 && r.log[hint-1].Term == bad {
 			hint--
@@ -452,8 +379,7 @@ func (r *Raft) OnAppendEntries(a Append) Reply {
 	}
 
 	if a.Commit > r.commit {
-		last, _ := r.last()
-		r.commit = min(a.Commit, last)
+		r.commit = min(a.Commit, len(r.log)-1)
 	}
 	return Reply{Term: r.term, Ok: true}
 }
