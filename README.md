@@ -9,4 +9,6 @@ instances hashes each key onto a ring and sends it to the node that owns it, so
 adding a node only moves the keys right before it instead of nearly all of
 them.
 
-Raft is next, so a node can die without taking its keys with it.
+There is also a Raft implementation with leader election and log replication.
+Kill the leader and the others elect a new one in a few hundred milliseconds,
+and every node ends up applying the same entries in the same order.
