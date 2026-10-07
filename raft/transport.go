@@ -15,8 +15,8 @@ func (s *Service) RequestVote(v Vote, reply *Reply) error {
 	return nil
 }
 
-func (s *Service) AppendEntries(b Beat, reply *Reply) error {
-	*reply = s.raft.OnAppendEntries(b)
+func (s *Service) AppendEntries(a Append, reply *Reply) error {
+	*reply = s.raft.OnAppendEntries(a)
 	return nil
 }
 
@@ -75,8 +75,8 @@ func (p *remote) RequestVote(v Vote) (Reply, error) {
 	return reply, err
 }
 
-func (p *remote) AppendEntries(b Beat) (Reply, error) {
+func (p *remote) AppendEntries(a Append) (Reply, error) {
 	var reply Reply
-	err := p.call("Raft.AppendEntries", b, &reply)
+	err := p.call("Raft.AppendEntries", a, &reply)
 	return reply, err
 }
